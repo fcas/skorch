@@ -11,11 +11,11 @@ from functools import partial
 import io
 from itertools import tee
 import pathlib
+import pickle
 import warnings
 
 import numpy as np
 from scipy import sparse
-import sklearn
 from sklearn.exceptions import NotFittedError
 from sklearn.utils import _safe_indexing as safe_indexing
 from sklearn.utils.validation import check_is_fitted as sk_check_is_fitted
@@ -59,6 +59,13 @@ def is_geometric_data_type(x):
     return isinstance(x, Data)
 
 
+def _check_device(device):
+    """Resolve special device shortcuts."""
+    if device == 'auto':
+        return 'cuda' if torch.cuda.is_available() else 'cpu'
+    return device
+
+
 # pylint: disable=not-callable
 def to_tensor(X, device, accept_sparse=False):
     """Turn input data to torch tensor.
@@ -77,7 +84,8 @@ def to_tensor(X, device, accept_sparse=False):
     device : str, torch.device
       The compute device to be used. If set to 'cuda', data in torch
       tensors will be pushed to cuda tensors before being sent to the
-      module.
+      module. If set to 'auto', hardware acceleration like CUDA is
+      being used if available, and CPU otherwise.
 
     accept_sparse : bool (default=False)
       Whether to accept scipy sparse matrices as input. If False,
@@ -89,6 +97,7 @@ def to_tensor(X, device, accept_sparse=False):
     output : torch Tensor
 
     """
+    device = _check_device(device)
     to_tensor_ = partial(to_tensor, device=device)
 
     if is_torch_data_type(X):
@@ -157,6 +166,9 @@ def to_numpy(X):
     if hasattr(X, 'is_mps') and X.is_mps:
         X = X.cpu()
 
+    if X.device.type != "cpu":
+        X = X.cpu()
+
     if X.requires_grad:
         X = X.detach()
 
@@ -182,9 +194,12 @@ def to_device(X, device):
 
     device : str, torch.device
         The compute device to be used. If device=None, return the input
-        unmodified
+        unmodified. If device='auto', hardware acceleration like CUDA
+        is being used if available, and CPU otherwise.
 
     """
+    device = _check_device(device)
+
     if device is None:
         return X
 
@@ -559,6 +574,7 @@ def get_map_location(target_device, fallback_device='cpu'):
     """
     if target_device is None:
         target_device = fallback_device
+    target_device = _check_device(target_device)
 
     map_location = torch.device(target_device)
 
@@ -637,7 +653,7 @@ def _sigmoid_then_2d(x):
     return _make_2d_probs(prob)
 
 
-# TODO only needed if multiclass GP classfication is added
+# TODO only needed if multiclass GP classification is added
 # def _transpose(x):
     # return x.T
 
@@ -660,6 +676,8 @@ def _infer_predict_nonlinearity(net):
         return _identity
 
     criterion = getattr(net, net._criteria[0] + '_')
+    # unwrap optimizer in case of torch.compile being used
+    criterion = getattr(criterion, '_orig_mod', criterion)
 
     if isinstance(criterion, CrossEntropyLoss):
         return partial(torch.softmax, dim=-1)
@@ -673,7 +691,7 @@ def _infer_predict_nonlinearity(net):
     return _identity
 
     # TODO: Add the code below to _infer_predict_nonlinearity if multiclass GP
-    # classfication is added.
+    # classification is added.
     # likelihood = getattr(net, 'likelihood_', None)
     # if likelihood is None:
     #     return _identity
@@ -766,3 +784,35 @@ def _check_f_arguments(caller_name, **kwargs):
             key = 'module_' if key == 'f_params' else key[2:] + '_'
             kwargs_module[key] = val
     return kwargs_module, kwargs_other
+
+
+class _TorchLoadUnpickler(pickle.Unpickler):
+    """
+    Subclass of pickle.Unpickler that intercepts 'torch.storage._load_from_bytes' calls
+    and uses `torch.load(..., map_location=..., torch_load_kwargs=...)`.
+
+    This way, we can use normal pickle when unpickling a skorch net but still benefit
+    from torch.load to handle the map_location. Note that `with torch.device(...)` does
+    not work for unpickling.
+
+    """
+
+    def __init__(self, *args, map_location, torch_load_kwargs, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.map_location = map_location
+        self.torch_load_kwargs = torch_load_kwargs
+
+    def find_class(self, module, name):
+        # The actual serialized data for PyTorch tensors references
+        # torch.storage._load_from_bytes internally. We intercept that call:
+        if (module == 'torch.storage') and (name == '_load_from_bytes'):
+            # Return a function that uses torch.load with our desired map_location
+            def _load_from_bytes(b):
+                return torch.load(
+                    io.BytesIO(b),
+                    map_location=self.map_location,
+                    **self.torch_load_kwargs
+                )
+            return _load_from_bytes
+
+        return super().find_class(module, name)

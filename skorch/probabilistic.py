@@ -8,10 +8,12 @@
 
 import pickle
 import re
+import textwrap
 
 import gpytorch
 import numpy as np
 import torch
+from sklearn.base import ClassifierMixin, RegressorMixin
 
 from skorch.net import NeuralNet
 from skorch.dataset import ValidSplit
@@ -229,7 +231,7 @@ class GPBase(NeuralNet):
 
         device : string (default='cpu')
           The device to store each inference result on.
-          This defaults to CPU memory since there is genereally
+          This defaults to CPU memory since there is generally
           more memory available there. For performance reasons
           this might be changed to a specific CUDA device,
           e.g. 'cuda:0'.
@@ -287,7 +289,7 @@ class GPBase(NeuralNet):
 
         device : string (default='cpu')
           The device to store each inference result on.
-          This defaults to CPU memory since there is genereally
+          This defaults to CPU memory since there is generally
           more memory available there. For performance reasons
           this might be changed to a specific CUDA device,
           e.g. 'cuda:0'.
@@ -391,7 +393,7 @@ class GPBase(NeuralNet):
             raise pickle.PicklingError(msg) from exc
 
 
-class _GPRegressorPredictMixin:
+class _GPRegressorPredictMixin(RegressorMixin):
     """Mixin class that provides a predict method for GP regressors."""
     def predict(self, X, return_std=False, return_cov=False):
         """Returns the predicted mean and optionally standard deviation.
@@ -470,7 +472,6 @@ exact_gp_regr_module_text = """
     Module : gpytorch.models.ExactGP (class or instance)
       The module needs to return a
       :class:`~gpytorch.distributions.MultivariateNormal` distribution.
-
 """
 
 exact_gp_regr_criterion_text = """
@@ -482,7 +483,6 @@ exact_gp_regr_criterion_text = """
     criterion : gpytorch.mlls.ExactMarginalLogLikelihood
       The objective function to learn the posterior of of the GP regressor.
       Usually doesn't need to be changed.
-
 """
 
 exact_gp_regr_batch_size_text = """
@@ -491,7 +491,6 @@ exact_gp_regr_batch_size_text = """
       Mini-batch size. For exact GPs, it must be set to -1, since the exact
       solution cannot deal with batching. To make use of batching, use
       :class:`.GPRegressor` in conjunction with a variational strategy.
-
 """
 
 # this is the same text for exact and approximate GP regression
@@ -504,37 +503,40 @@ gp_regr_train_split_text = """
       None. There is no default train split for GP regressors because random
       splitting is typically not desired, e.g. because there is a temporal
       relationship between samples.
-
 """
 
 # this is the same text for all GPs
 gp_likelihood_attribute_text = """
-
     likelihood_: torch module (instance)
       The instantiated likelihood.
-
 """
 
 
 def get_exact_gp_regr_doc(doc):
     """Customizes the net docs to avoid duplication."""
+    # dedent/indent roundtrip required for consistent indentation in both
+    # Python <3.13 and Python >=3.13
+    # Because <3.13 => no automatic dedent, but it is the case in >=3.13
+    indentation = "    "
+    doc = textwrap.indent(textwrap.dedent(doc.split("\n", 5)[-1]), indentation)
+
     params_start_idx = doc.find('    Parameters\n    ----------')
     doc = doc[params_start_idx:]
-    doc = exact_gp_regr_doc_start + " " + doc
+    doc = exact_gp_regr_doc_start + doc
 
-    pattern = re.compile(r'(\n\s+)(module .*\n)(\s.+){1,99}')
+    pattern = re.compile(r'(\n\s+)(module .*\n)(\s.+|.){1,99}')
     start, end = pattern.search(doc).span()
     doc = doc[:start] + exact_gp_regr_module_text + doc[end:]
 
-    pattern = re.compile(r'(\n\s+)(criterion .*\n)(\s.+){1,99}')
+    pattern = re.compile(r'(\n\s+)(criterion .*\n)(\s.+|.){1,99}')
     start, end = pattern.search(doc).span()
     doc = doc[:start] + exact_gp_regr_criterion_text + doc[end:]
 
-    pattern = re.compile(r'(\n\s+)(batch_size .*\n)(\s.+){1,99}')
+    pattern = re.compile(r'(\n\s+)(batch_size .*\n)(\s.+|.){1,99}')
     start, end = pattern.search(doc).span()
     doc = doc[:start] + exact_gp_regr_batch_size_text + doc[end:]
 
-    pattern = re.compile(r'(\n\s+)(train_split .*\n)(\s.+){1,99}')
+    pattern = re.compile(r'(\n\s+)(train_split .*\n)(\s.+|.){1,99}')
     start, end = pattern.search(doc).span()
     doc = doc[:start] + gp_regr_train_split_text + doc[end:]
 
@@ -671,7 +673,6 @@ gp_regr_module_text = """
     Module : gpytorch.models.ApproximateGP (class or instance)
       The GPyTorch module; in contrast to exact GP, the return distribution does
       not need to be Gaussian.
-
 """
 
 gp_regr_criterion_text = """
@@ -683,25 +684,30 @@ gp_regr_criterion_text = """
     criterion : gpytorch.mlls.VariationalELBO
       The objective function to learn the approximate posterior of of the GP
       regressor.
-
 """
 
 
 def get_gp_regr_doc(doc):
     """Customizes the net docs to avoid duplication."""
+    # dedent/indent roundtrip required for consistent indentation in both
+    # Python <3.13 and Python >=3.13
+    # Because <3.13 => no automatic dedent, but it is the case in >=3.13
+    indentation = "    "
+    doc = textwrap.indent(textwrap.dedent(doc.split("\n", 5)[-1]), indentation)
+
     params_start_idx = doc.find('    Parameters\n    ----------')
     doc = doc[params_start_idx:]
-    doc = gp_regr_doc_start + " " + doc
+    doc = gp_regr_doc_start + doc
 
-    pattern = re.compile(r'(\n\s+)(module .*\n)(\s.+){1,99}')
+    pattern = re.compile(r'(\n\s+)(module .*\n)(\s.+|.){1,99}')
     start, end = pattern.search(doc).span()
     doc = doc[:start] + gp_regr_module_text + doc[end:]
 
-    pattern = re.compile(r'(\n\s+)(criterion .*\n)(\s.+){1,99}')
+    pattern = re.compile(r'(\n\s+)(criterion .*\n)(\s.+|.){1,99}')
     start, end = pattern.search(doc).span()
     doc = doc[:start] + gp_regr_criterion_text + doc[end:]
 
-    pattern = re.compile(r'(\n\s+)(train_split .*\n)(\s.+){1,99}')
+    pattern = re.compile(r'(\n\s+)(train_split .*\n)(\s.+|.){1,99}')
     start, end = pattern.search(doc).span()
     doc = doc[:start] + gp_regr_train_split_text + doc[end:]
 
@@ -743,7 +749,6 @@ gp_binary_clf_module_text = """
     Module : gpytorch.models.ApproximateGP (class or instance)
       The GPyTorch module; in contrast to exact GP, the return distribution does
       not need to be Gaussian.
-
 """
 
 gp_binary_clf_criterion_text = """
@@ -755,21 +760,26 @@ gp_binary_clf_criterion_text = """
     criterion : gpytorch.mlls.VariationalELBO
       The objective function to learn the approximate posterior of of the GP
       binary classification.
-
 """
 
 
 def get_gp_binary_clf_doc(doc):
     """Customizes the net docs to avoid duplication."""
+    # dedent/indent roundtrip required for consistent indentation in both
+    # Python <3.13 and Python >=3.13
+    # Because <3.13 => no automatic dedent, but it is the case in >=3.13
+    indentation = "    "
+    doc = textwrap.indent(textwrap.dedent(doc.split("\n", 5)[-1]), indentation)
+
     params_start_idx = doc.find('    Parameters\n    ----------')
     doc = doc[params_start_idx:]
-    doc = gp_binary_clf_doc_start + " " + doc
+    doc = gp_binary_clf_doc_start + doc
 
-    pattern = re.compile(r'(\n\s+)(module .*\n)(\s.+){1,99}')
+    pattern = re.compile(r'(\n\s+)(module .*\n)(\s.+|.){1,99}')
     start, end = pattern.search(doc).span()
     doc = doc[:start] + gp_binary_clf_module_text + doc[end:]
 
-    pattern = re.compile(r'(\n\s+)(criterion .*\n)(\s.+){1,99}')
+    pattern = re.compile(r'(\n\s+)(criterion .*\n)(\s.+|.){1,99}')
     start, end = pattern.search(doc).span()
     doc = doc[:start] + gp_binary_clf_criterion_text + doc[end:]
 
@@ -778,7 +788,7 @@ def get_gp_binary_clf_doc(doc):
     return doc
 
 
-class GPBinaryClassifier(GPBase):
+class GPBinaryClassifier(ClassifierMixin, GPBase):
     __doc__ = get_gp_binary_clf_doc(NeuralNet.__doc__)
 
     def __init__(

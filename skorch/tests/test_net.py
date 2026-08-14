@@ -16,12 +16,13 @@ from unittest.mock import call
 from unittest.mock import patch
 import sys
 import time
+import warnings
 from contextlib import ExitStack
 
 from flaky import flaky
 import numpy as np
 import pytest
-from sklearn.base import clone
+from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import GridSearchCV
@@ -30,6 +31,8 @@ from sklearn.preprocessing import StandardScaler
 import torch
 from torch import nn
 
+import skorch
+from skorch.toy import MLPModule
 from skorch.tests.conftest import INFERENCE_METHODS
 from skorch.utils import flatten
 from skorch.utils import to_numpy
@@ -259,7 +262,7 @@ class TestNeuralNet:
 
         # the following line used to raise this error: "TypeError: Got
         # an unexpected argument optimizer_2__lr, did you mean
-        # optimizer__2__lr?" because it was erronously assumed that
+        # optimizer__2__lr?" because it was erroneously assumed that
         # "optimizer_2__lr" should be dispatched to "optimizer", not
         # "optimizer_2".
         MyNet(module_cls, optimizer_2__lr=0.123)  # should not raise
@@ -292,7 +295,7 @@ class TestNeuralNet:
         pass
 
     @pytest.mark.parametrize('method', INFERENCE_METHODS)
-    def test_not_fitted_raises(self, net_cls, module_cls, data, method):
+    def test_not_init_raises(self, net_cls, module_cls, data, method):
         from skorch.exceptions import NotInitializedError
         net = net_cls(module_cls)
         X = data[0]
@@ -303,6 +306,21 @@ class TestNeuralNet:
         msg = ("This NeuralNetClassifier instance is not initialized yet. "
                "Call 'initialize' or 'fit' with appropriate arguments "
                "before using this method.")
+        assert exc.value.args[0] == msg
+
+    def test_not_fitted_raises(self, net_cls, module_cls):
+        from sklearn.utils.validation import check_is_fitted
+        from sklearn.exceptions import NotFittedError
+    
+        net = net_cls(module_cls)
+        with pytest.raises(NotFittedError) as exc:
+            check_is_fitted(net)
+
+        msg = (
+            "This NeuralNetClassifier instance is not fitted yet. "
+            "Call 'fit' with appropriate arguments before "
+            "using this estimator."
+        )
         assert exc.value.args[0] == msg
 
     def test_not_fitted_other_attributes(self, module_cls):
@@ -327,6 +345,34 @@ class TestNeuralNet:
         net.fit(X, y)
         y_pred = net.predict(X)
         assert accuracy_score(y, y_pred) > ACCURACY_EXPECTED
+
+    @pytest.mark.parametrize('cuda_available, expected', [
+        (False, 'cpu'),
+        (True, 'cuda'),
+    ])
+    def test_device_auto_fit_predict(
+            self, net_cls, module_cls, data, cuda_available, expected):
+        if cuda_available and not torch.cuda.is_available():
+            pytest.skip()
+
+        X, y = data
+        with patch('torch.cuda.is_available', lambda *_: cuda_available):
+            net = net_cls(
+                module_cls,
+                max_epochs=10,
+                lr=0.1,
+                device='auto',
+            )
+            net.fit(X, y)
+            y_pred = net.predict(X)
+            y_forward = net.forward(X, device='auto')
+
+        assert accuracy_score(y, y_pred) > ACCURACY_EXPECTED
+        assert all(
+            param.device.type == expected
+            for _, param in net.get_all_learnable_params()
+        )
+        assert y_forward.device.type == expected
 
     def test_forward(self, net_fit, data):
         X = data[0]
@@ -450,6 +496,21 @@ class TestNeuralNet:
         net = net.initialize()
         assert net.module_.sequential[0].weight.device.type.startswith(device)
 
+    @pytest.mark.parametrize('cuda_available, expected', [
+        (False, 'cpu'),
+        (True, 'cuda'),
+    ])
+    def test_device_auto(
+            self, net_cls, module_cls, cuda_available, expected):
+        if cuda_available and not torch.cuda.is_available():
+            pytest.skip()
+
+        with patch('torch.cuda.is_available', lambda *_: cuda_available):
+            net = net_cls(module=module_cls, device='auto')
+            net = net.initialize()
+
+        assert net.module_.sequential[0].weight.device.type == expected
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="no cuda device")
     @pytest.mark.parametrize(
         'save_dev, cuda_available, load_dev, expect_warning',
@@ -468,6 +529,7 @@ class TestNeuralNet:
             cuda_available,
             load_dev,
             expect_warning,
+            recwarn,
     ):
         from skorch.exceptions import DeviceWarning
         net = net_cls(module=module_cls, device=save_dev).initialize()
@@ -479,9 +541,12 @@ class TestNeuralNet:
 
         with patch('torch.cuda.is_available', lambda *_: cuda_available):
             with open(str(p), 'rb') as f:
-                expected_warning = DeviceWarning if expect_warning else None
-                with pytest.warns(expected_warning) as w:
+                if not expect_warning:
                     m = pickle.load(f)
+                    assert not any(w.category == DeviceWarning for w in recwarn.list)
+                else:
+                    with pytest.warns(DeviceWarning) as w:
+                        m = pickle.load(f)
 
         assert torch.device(m.device) == torch.device(load_dev)
 
@@ -489,6 +554,7 @@ class TestNeuralNet:
             # We should have captured two warnings:
             # 1. one for the failed load
             # 2. for switching devices on the net instance
+            # remove possible future warning about weights_only=False
             assert len(w.list) == 2
             assert w.list[0].message.args[0] == (
                 'Requested to load data to CUDA but no CUDA devices '
@@ -556,6 +622,17 @@ class TestNeuralNet:
                "Module or Optimizer; make sure that it exists and check for typos.")
         with pytest.raises(AttributeError, match=msg):
             net_fit.load_params(f_unknown='some-file.pt')
+
+    def test_load_params_no_warning(self, net_fit, tmp_path, recwarn):
+        # See discussion in 1063
+        # Ensure that there is no FutureWarning (and DeprecationWarning for good
+        # measure) caused by torch.load.
+        net_fit.save_params(f_params=tmp_path / 'weights.pt')
+        net_fit.load_params(f_params=tmp_path / 'weights.pt')
+        assert not any(
+            isinstance(warning.message, (DeprecationWarning, FutureWarning))
+            for warning in recwarn.list
+        )
 
     @pytest.mark.parametrize('use_safetensors', [False, True])
     def test_save_load_state_dict_file(
@@ -1136,7 +1213,7 @@ class TestNeuralNet:
         # test that the error message of set_params includes helpful
         # information instead of, e.g., generator expressions.
         # sklearn 0.2x does not output the parameter names so we can
-        # skip detailled checks of the error message there.
+        # skip detailed checks of the error message there.
 
         sklearn_0_2x_string = "Check the list of available parameters with `estimator.get_params().keys()`"
 
@@ -1318,6 +1395,62 @@ class TestNeuralNet:
         assert net.optimizer_.param_groups[0]['lr'] == 0.1
         assert net.optimizer_.param_groups[1]['lr'] == 0.5
         assert net.optimizer_.param_groups[2]['lr'] == net.lr
+
+    @pytest.mark.parametrize('param_groups, expected_count, expected_msgs', [
+        ([], 0, []),
+        (
+            [('sequential.0.*', {'lr': 0.1})],
+            1,
+            [
+                "Setting param group {'lr': 0.1} for",
+                'sequential.0.weight',
+                'sequential.0.bias',
+            ],
+        ),
+        (
+            [
+                ('sequential.0.*', {'lr': 0.1}),
+                ('sequential.3.*', {'lr': 0.5}),
+            ],
+            2,
+            [
+                "Setting param group {'lr': 0.1} for",
+                "Setting param group {'lr': 0.5} for",
+                'sequential.0.weight',
+                'sequential.3.weight',
+            ],
+        ),
+    ])
+    def test_optimizer_param_groups_verbose_prints(
+            self, net_cls, module_cls, data, param_groups, expected_count,
+            expected_msgs, capsys):
+        # fit instead of initialize so accidental repetitions during
+        # training would be caught by the count
+        X, y = data
+        net = net_cls(
+            module_cls,
+            verbose=1,
+            max_epochs=2,
+            optimizer__param_groups=param_groups,
+        )
+        net.fit(X, y)
+        out = capsys.readouterr().out
+        assert out.count('Setting param group') == expected_count
+        for expected in expected_msgs:
+            assert expected in out
+
+    def test_optimizer_param_groups_silent_when_verbose_0(
+            self, net_cls, module_cls, capsys):
+        net = net_cls(
+            module_cls,
+            verbose=0,
+            optimizer__param_groups=[
+                ('sequential.0.*', {'lr': 0.1}),
+            ],
+        )
+        net.initialize()
+        out = capsys.readouterr().out
+        assert 'Setting param group' not in out
 
     def test_module_params_in_init(self, net_cls, module_cls, data):
         X, y = data
@@ -2083,6 +2216,92 @@ class TestNeuralNet:
         assert exc.value.args[0] == msg
 
     @pytest.fixture
+    def iterable_dataset_cls(self):
+        class MyIterableDataset(torch.utils.data.IterableDataset):
+            def __init__(self, X, y):
+                super().__init__()
+                self.X = X
+                self.y = y
+
+            def __iter__(self):
+                return iter(zip(self.X, self.y))
+
+        return MyIterableDataset
+
+    def test_fit_with_iterable_dataset_and_train_split_raises(
+            self, net_cls, module_cls, iterable_dataset_cls, data):
+        from skorch.dataset import ValidSplit
+
+        net = net_cls(
+            module_cls,
+            max_epochs=1,
+            train_split=ValidSplit(stratified=False),
+        )
+        ds = iterable_dataset_cls(*data)
+        with pytest.raises(ValueError) as exc:
+            net.fit(ds, None)
+
+        msg = ("Cannot perform a CV split on an IterableDataset because it has "
+               "no length. Set train_split=None to disable the internal "
+               "validation split, or pass a train_split that supports "
+               "IterableDataset.")
+        assert exc.value.args[0] == msg
+        assert isinstance(exc.value.__cause__, TypeError)
+
+    def test_fit_with_iterable_dataset_no_train_split(
+            self, net_cls, module_cls, iterable_dataset_cls, data):
+        net = net_cls(module_cls, max_epochs=1, train_split=None)
+        ds = iterable_dataset_cls(*data)
+        net.fit(ds, None)  # does not raise
+
+        assert 'train_loss' in net.history[-1]
+
+    @pytest.fixture
+    def sized_iterable_dataset_cls(self):
+        class MySizedIterableDataset(torch.utils.data.IterableDataset):
+            def __init__(self, X, y):
+                super().__init__()
+                self.X = X
+                self.y = y
+
+            def __iter__(self):
+                return iter(zip(self.X, self.y))
+
+            def __len__(self):
+                return len(self.y)
+
+            def __getitem__(self, i):
+                return self.X[i], self.y[i]
+
+        return MySizedIterableDataset
+
+    def test_fit_with_sized_iterable_dataset_and_train_split(
+            self, net_cls, module_cls, sized_iterable_dataset_cls, data):
+        from skorch.dataset import ValidSplit
+
+        net = net_cls(
+            module_cls,
+            max_epochs=1,
+            train_split=ValidSplit(stratified=False),
+        )
+        ds = sized_iterable_dataset_cls(*data)
+        net.fit(ds, None)  # does not raise
+
+        assert 'valid_loss' in net.history[-1]
+
+    def test_fit_with_iterable_dataset_and_custom_train_split(
+            self, net_cls, module_cls, iterable_dataset_cls, data):
+        # a train_split that never indexes the dataset must keep working
+        def train_split(dataset, **kwargs):
+            return dataset, dataset
+
+        net = net_cls(module_cls, max_epochs=1, train_split=train_split)
+        ds = iterable_dataset_cls(*data)
+        net.fit(ds, None)  # does not raise
+
+        assert 'valid_loss' in net.history[-1]
+
+    @pytest.fixture
     def dataset_1_item(self):
         class Dataset(torch.utils.data.Dataset):
             def __len__(self):
@@ -2825,7 +3044,7 @@ class TestNeuralNet:
             self, net_cls, module_cls
     ):
         # When a module references another module, it will yield that modules'
-        # parameters. Therefore, if we collect all paramters, we have to make
+        # parameters. Therefore, if we collect all parameters, we have to make
         # sure that there are no duplicate parameters.
         class MyCriterion(torch.nn.NLLLoss):
             """Criterion that references net.module_"""
@@ -2978,6 +3197,98 @@ class TestNeuralNet:
         net_new.load_params(f_custom=tmpdir_custom, use_safetensors=use_safetensors)
         weights_loaded = net_new.custom_.state_dict()['sequential.3.weight']
         assert (weights_before == weights_loaded).all()
+
+    def test_torch_load_kwargs_auto_weights_only_true_when_load_params(
+            self, net_cls, module_cls, monkeypatch, tmp_path
+    ):
+        # Here we assume that the torch version is high enough that weights_only
+        # defaults to True. Check that when no argument is set in skorch, the
+        # right default is used.
+        # See discussion in 1063
+        net = net_cls(module_cls).initialize()
+        net.save_params(f_params=tmp_path / 'params.pkl')
+        state_dict = net.module_.state_dict()
+        expected_kwargs = {"weights_only": True}
+
+        mock_torch_load = Mock(return_value=state_dict)
+        monkeypatch.setattr(torch, "load", mock_torch_load)
+
+        net.load_params(f_params=tmp_path / 'params.pkl')
+
+        call_kwargs = mock_torch_load.call_args_list[0].kwargs
+        del call_kwargs['map_location']  # we're not interested in that
+        assert call_kwargs == expected_kwargs
+
+    def test_torch_load_kwargs_forwarded_to_torch_load(
+            self, net_cls, module_cls, monkeypatch, tmp_path
+    ):
+        # Here we check that custom set torch load args are forwarded to
+        # torch.load.
+        # See discussion in 1063
+        expected_kwargs = {'weights_only': 123, 'foo': 'bar'}
+        net = net_cls(module_cls, torch_load_kwargs=expected_kwargs).initialize()
+        net.save_params(f_params=tmp_path / 'params.pkl')
+        state_dict = net.module_.state_dict()
+
+        mock_torch_load = Mock(return_value=state_dict)
+        monkeypatch.setattr(torch, "load", mock_torch_load)
+
+        net.load_params(f_params=tmp_path / 'params.pkl')
+
+        call_kwargs = mock_torch_load.call_args_list[0].kwargs
+        del call_kwargs['map_location']  # we're not interested in that
+        assert call_kwargs == expected_kwargs
+
+    def test_torch_load_kwargs_auto_weights_true(
+            self, net_cls, module_cls, monkeypatch, tmp_path
+    ):
+        # See discussion in 1063.
+        net = net_cls(module_cls).initialize()
+        net.save_params(f_params=tmp_path / 'params.pkl')
+        state_dict = net.module_.state_dict()
+        expected_kwargs = {"weights_only": True}
+
+        mock_torch_load = Mock(return_value=state_dict)
+        monkeypatch.setattr(torch, "load", mock_torch_load)
+        net.load_params(f_params=tmp_path / 'params.pkl')
+
+        call_kwargs = mock_torch_load.call_args_list[0].kwargs
+        del call_kwargs['map_location']  # we're not interested in that
+        assert call_kwargs == expected_kwargs
+
+    def test_torch_load_kwargs_forwarded_to_torch_load_unpickle(
+            self, net_cls, module_cls, monkeypatch, tmp_path
+    ):
+        # See discussion in 1090
+        # Here we check that custom set torch load args are forwarded to
+        # torch.load even when using pickle. This is the same test otherwise as
+        # test_torch_load_kwargs_forwarded_to_torch_load
+        expected_kwargs = {'weights_only': 123, 'foo': 'bar'}
+        net = net_cls(module_cls, torch_load_kwargs=expected_kwargs).initialize()
+
+        original_torch_load = torch.load
+        # call original torch.load without extra params to prevent error:
+        mock_torch_load = Mock(
+            side_effect=lambda *args, **kwargs: original_torch_load(*args)
+        )
+        monkeypatch.setattr(torch, "load", mock_torch_load)
+        dumped = pickle.dumps(net)
+        pickle.loads(dumped)
+
+        call_kwargs = mock_torch_load.call_args_list[0].kwargs
+        del call_kwargs['map_location']  # we're not interested in that
+        assert call_kwargs == expected_kwargs
+
+    def test_unpickle_no_pytorch_warning(self, net_cls, module_cls, recwarn):
+        # See discussion 1090
+        # When using pickle, i.e. when going through __setstate__, we don't want to get
+        # any warnings about the usage of weights_only.
+        net = net_cls(module_cls).initialize()
+        dumped = pickle.dumps(net)
+        pickle.loads(dumped)
+
+        msg_content = "weights_only"
+        assert not any(msg_content in str(w.message) for w in recwarn.list)
 
     def test_custom_module_params_passed_to_optimizer(
             self, net_custom_module_cls, module_cls):
@@ -3297,7 +3608,7 @@ class TestNeuralNet:
                 super().__init__(*args, **kwargs)
                 self.foo_ = module_cls()
 
-        msg = ("Trying to set torch compoment 'foo_' outside of an initialize method. "
+        msg = ("Trying to set torch component 'foo_' outside of an initialize method. "
                "Consider defining it inside 'initialize_module'")
         with pytest.raises(SkorchAttributeError, match=msg):
             MyNet(module_cls)
@@ -3307,14 +3618,14 @@ class TestNeuralNet:
     ):
         from skorch.exceptions import SkorchAttributeError
 
-        # all optimzers should be set within an initialize method
+        # all optimizers should be set within an initialize method
         class MyNet(net_cls):
             def initialize(self):
                 super().initialize()
                 self.opti = torch.optim.Adam(self.module_.parameters())
                 return self
 
-        msg = ("Trying to set torch compoment 'opti' outside of an initialize method. "
+        msg = ("Trying to set torch component 'opti' outside of an initialize method. "
                "Consider defining it inside 'initialize_optimizer'")
         with pytest.raises(SkorchAttributeError, match=msg):
             MyNet(module_cls).initialize()
@@ -4112,16 +4423,6 @@ class TestTorchCompile:
         net.set_params(compile__mode='reduce-overhead')
         assert mock_compile.call_count == 4
 
-    def test_compile_true_but_not_available_raises(
-            self, net_cls, module_cls, monkeypatch
-    ):
-        if hasattr(torch, 'compile'):
-            monkeypatch.delattr(torch, 'compile')
-
-        msg = "Setting compile=True but torch.compile is not available"
-        with pytest.raises(ValueError, match=msg):
-            net_cls(module_cls, compile=True).initialize()
-
     def test_compile_missing_dunder_in_prefix_arguments(
             self, net_cls, module_cls, mock_compile  # pylint: disable=unused-argument
     ):
@@ -4139,9 +4440,6 @@ class TestTorchCompile:
             ).initialize()
 
     def test_fit_and_predict_with_compile(self, net_cls, module_cls, data):
-        if not hasattr(torch, 'compile'):
-            pytest.skip(reason="torch.compile not available")
-
         # use real torch.compile, not mocked, can be a bit slow
         X, y = data
         net = net_cls(module_cls, max_epochs=1, compile=True).initialize()
@@ -4155,3 +4453,285 @@ class TestTorchCompile:
         # compiled, we rely here on torch keeping this public attribute
         assert hasattr(net.module_, 'dynamo_ctx')
         assert hasattr(net.criterion_, 'dynamo_ctx')
+
+    def test_binary_classifier_with_compile(self, data):
+        # issue 1057 the problem was that compile would wrap the optimizer,
+        # resulting in _infer_predict_nonlinearity to return the wrong result
+        # because of a failing isinstance check
+        from skorch import NeuralNetBinaryClassifier
+
+        X, y = data[0], data[1].astype(np.float32)
+
+        class MyNet(nn.Module):
+            def __init__(self):
+                super(MyNet, self).__init__()
+                self.linear = nn.Linear(20, 10)
+                self.output = nn.Linear(10, 1)
+
+            def forward(self, input):
+                out = self.linear(input)
+                out = nn.functional.relu(out)
+                out = self.output(out)
+                return out.squeeze(-1)
+
+        net = NeuralNetBinaryClassifier(
+            MyNet,
+            max_epochs=3,
+            compile=True,
+        )
+        # check that no error is raised
+        net.fit(X, y)
+
+        y_proba = net.predict_proba(X)
+        y_pred = net.predict(X)
+        assert y_proba.shape == (X.shape[0], 2)
+        assert y_pred.shape == (X.shape[0],)
+
+
+# Module-scope helpers for TestMetadataRouting. Defined at module
+# level (not inside the test class) so they are picklable — sklearn
+# 1.8's routing infrastructure deepcopies the net, which triggers
+# NeuralNet.__getstate__ / pickle.dump on the wrapped module.
+_ROUTING_RECORDED_FIT_PARAMS = []
+
+
+class _RoutingRecordingModule(MLPModule):
+    def forward(self, X, **fit_params):
+        _ROUTING_RECORDED_FIT_PARAMS.append(fit_params)
+        return super().forward(X)
+
+
+class _RoutingKwargsModule(MLPModule):
+    def forward(self, X, **kwargs):
+        return super().forward(X)
+
+
+class _RoutingRegressionModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(10, 1)
+
+    def forward(self, X, Z, **kwargs):
+        return self.fc(X + Z)
+
+
+class _RoutingDictScaler(TransformerMixin, BaseEstimator):
+    def fit(self, X, y=None):
+        self.scaler_ = StandardScaler().fit(X['X'])
+        return self
+
+    def transform(self, X):
+        result = dict(X)
+        result['X'] = self.scaler_.transform(X['X']).astype('float32')
+        return result
+
+
+class TestMetadataRouting:
+    """Tests for sklearn metadata routing support.
+
+    NeuralNet is implemented as a router + consumer: it routes
+    metadata (e.g. groups) to its internal CV splitter, and consumes
+    metadata (e.g. Z) itself for the module's forward method.
+    """
+
+    @pytest.fixture(scope='module')
+    def data(self, classifier_data):
+        return classifier_data
+
+    @pytest.fixture(scope='module')
+    def module_cls(self, classifier_module):
+        return classifier_module
+
+    @pytest.fixture(scope='module')
+    def net_cls(self):
+        from skorch import NeuralNetClassifier
+        return NeuralNetClassifier
+
+    @pytest.fixture
+    def routing_enabled(self):
+        import sklearn
+        with sklearn.config_context(enable_metadata_routing=True):
+            yield
+
+    @pytest.fixture
+    def recorded_fit_params(self):
+        _ROUTING_RECORDED_FIT_PARAMS.clear()
+        yield _ROUTING_RECORDED_FIT_PARAMS
+        _ROUTING_RECORDED_FIT_PARAMS.clear()
+
+    def test_set_request_requires_routing_enabled(self, net_cls, module_cls):
+        """set_fit_request and set_partial_fit_request raise when
+        routing is not enabled."""
+        net = net_cls(module_cls)
+        with pytest.raises(RuntimeError, match="metadata routing is enabled"):
+            net.set_fit_request(Z=True)
+        with pytest.raises(RuntimeError, match="metadata routing is enabled"):
+            net.set_partial_fit_request(Z=True)
+
+    def test_set_fit_request_returns_self(
+        self, net_cls, module_cls, routing_enabled
+    ):
+        net = net_cls(module_cls)
+        assert net.set_fit_request(Z=True) is net
+
+    def test_fit_with_extra_params_and_routing(
+        self, net_cls, data, routing_enabled, recorded_fit_params
+    ):
+        """Extra fit params declared via set_fit_request reach the
+        module's forward method when routing is enabled."""
+        X, y = data
+        net = net_cls(
+            _RoutingRecordingModule, max_epochs=1, batch_size=50,
+            train_split=None,
+        )
+        net.set_fit_request(foo=True, bar=True)
+        net.initialize()
+        net.callbacks_ = []
+        net.fit(X[:100], y[:100], foo=1, bar=2)
+
+        assert len(recorded_fit_params) == 2  # 1 epoch, 2 batches
+        assert recorded_fit_params[0] == dict(foo=1, bar=2)
+
+    def test_partial_fit_with_extra_params_and_routing(
+        self, net_cls, data, routing_enabled, recorded_fit_params
+    ):
+        """Extra fit params declared via set_partial_fit_request reach
+        the module's forward method when routing is enabled."""
+        X, y = data
+        net = net_cls(
+            _RoutingRecordingModule, max_epochs=1, batch_size=50,
+            train_split=None,
+        )
+        net.set_partial_fit_request(foo=True, bar=True)
+        net.initialize()
+        net.callbacks_ = []
+        net.partial_fit(X[:100], y[:100], foo=1, bar=2)
+
+        assert len(recorded_fit_params) == 2  # 1 epoch, 2 batches
+        assert recorded_fit_params[0] == dict(foo=1, bar=2)
+
+    def test_fit_with_extra_params_does_not_break_valid_split(
+        self, net_cls, data, routing_enabled
+    ):
+        """When routing is enabled, extra fit_params that are only
+        declared for self don't reach ValidSplit (which would reject
+        them)."""
+        X, y = data
+        net = net_cls(_RoutingKwargsModule, max_epochs=1, batch_size=50)
+        net.set_fit_request(Z=True)
+        # Should not raise — Z is consumed by self, not passed to ValidSplit
+        net.fit(X[:100], y[:100], Z=X[:100, :10])
+
+    def test_groups_routed_to_train_split(
+        self, net_cls, data, routing_enabled
+    ):
+        """groups reaches ValidSplit(GroupKFold) via the router
+        automatically — no set_fit_request needed."""
+        from sklearn.model_selection import GroupKFold
+        from skorch.dataset import ValidSplit
+
+        X, y = data
+        n = len(X) // 2
+        groups = np.array([0] * n + [1] * (len(X) - n))
+
+        net = net_cls(
+            _RoutingKwargsModule, max_epochs=1, batch_size=50,
+            train_split=ValidSplit(GroupKFold(2)),
+        )
+        # No set_fit_request(groups=True) needed — GroupKFold
+        # declares it needs groups, and the router picks that up.
+        net.fit(X, y, groups=groups)
+
+    def test_undeclared_param_rejected_by_routing(
+        self, net_cls, module_cls, routing_enabled
+    ):
+        """Passing metadata that no consumer requested raises."""
+        X = np.zeros((10, 20), dtype='float32')
+        y = np.zeros(10, dtype='int64')
+
+        net = net_cls(module_cls, max_epochs=1, train_split=None)
+        with pytest.raises(TypeError, match="unexpected argument"):
+            net.fit(X, y, unknown_param=1)
+
+    def test_clone_preserves_metadata_request(
+        self, net_cls, module_cls, routing_enabled
+    ):
+        """sklearn.clone preserves metadata routing requests set via
+        set_fit_request."""
+        net = net_cls(module_cls)
+        net.set_fit_request(Z=True)
+        net_cloned = clone(net)
+
+        # Verify by behavior: cloned net should accept Z without error
+        net_cloned.set_fit_request(Z=True)  # should not raise
+
+    def test_pipeline_with_routing_enabled(
+        self, net_cls, data, routing_enabled
+    ):
+        """NeuralNet works inside a Pipeline when routing is enabled."""
+        from skorch.toy import MLPModule
+
+        X, y = data
+        net = net_cls(MLPModule, max_epochs=1, batch_size=50, train_split=None)
+        pipe = Pipeline([('scale', StandardScaler()), ('net', net)])
+        pipe.fit(X[:100], y[:100])
+
+    def test_grid_search_with_routing(
+        self, net_cls, module_cls, data, routing_enabled
+    ):
+        """GridSearchCV works with metadata routing enabled."""
+        X, y = data
+        net = net_cls(
+            module_cls, max_epochs=1, batch_size=50, train_split=None,
+        )
+        gs = GridSearchCV(
+            net, param_grid={'lr': [0.01, 0.1]},
+            cv=2, refit=False, n_jobs=1,
+        )
+        gs.fit(X[:100], y[:100])
+
+    def test_backward_compat_fit_params_to_train_split(
+        self, net_cls, data, recorded_fit_params
+    ):
+        """Without routing enabled, all fit_params still reach
+        train_split (legacy behavior)."""
+        X, y = data
+
+        def recording_split(dataset, y=None, **fit_params):
+            recorded_fit_params.append(fit_params)
+            return dataset, dataset
+
+        net = net_cls(
+            _RoutingKwargsModule, max_epochs=1, batch_size=50,
+            train_split=recording_split,
+        )
+        net.initialize()
+        net.callbacks_ = []
+        net.fit(X[:100], y[:100], foo=1, bar=2)
+
+        assert len(recorded_fit_params) == 1
+        assert recorded_fit_params[0] == dict(foo=1, bar=2)
+
+    def test_pipeline_with_dict_x_and_groups_routing(
+        self, data, routing_enabled
+    ):
+        """End-to-end: Pipeline scales part of a dict X, routes groups
+        to GroupKFold, and trains a module that uses auxiliary data."""
+        from sklearn.model_selection import GroupKFold
+        from skorch.dataset import ValidSplit
+        from skorch import NeuralNetRegressor
+
+        X, _ = data
+        X_arr = X[:100, :10].astype('float32')
+        Z_arr = X[:100, 10:].astype('float32')
+        y = X[:100, 0].astype('float32').reshape(-1, 1)
+        groups = np.array([0] * 50 + [1] * 50)
+
+        X_dict = {'X': X_arr, 'Z': Z_arr}
+
+        net = NeuralNetRegressor(
+            _RoutingRegressionModule, max_epochs=2, lr=0.01,
+            train_split=ValidSplit(GroupKFold(2)),
+        )
+        pipe = Pipeline([('scale', _RoutingDictScaler()), ('net', net)])
+        pipe.fit(X_dict, y, groups=groups)

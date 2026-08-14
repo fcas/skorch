@@ -8,8 +8,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+- Add `device='auto'` to select hardware acceleration like CUDA when
+  available, and CPU otherwise.
+
 ### Changed
+
 ### Fixed
+
+- `ValidSplit` now raises a clear error when it receives an `IterableDataset`, instead of an opaque `TypeError` about a missing length (#594)
+
+## [1.4.0]
+
+### Added
+
+- Extend tensor conversion to numpy arrays to work with more device types (#1132)
+- Add sklearn metadata routing support: `NeuralNet` is now a metadata router + consumer, enabling `groups` and other metadata to flow through `Pipeline`/`GridSearchCV` (#1139)
+
+## [1.3.1]
+
+### Fixed
+
+- Compatibility with sklearn v1.8: `__sklearn_is_fitted__` returns a boolean (#1128)
+- Compatibility with sklearn v1.8: `SkorchDoctor` is now an sklearn `BaseEstimator` instance (#1128)
+
+## [1.3.0]
+
+### Fixed
+
+- Implement `__sklearn_is_fitted__` for skorch models, following [sklearn custom model protocol](https://scikit-learn.org/stable/auto_examples/developing_estimators/sklearn_is_fitted.html#sphx-glr-auto-examples-developing-estimators-sklearn-is-fitted-py) (#1119)
+
+## [1.2.0]
+
+### Added
+
+- Add Contributing Guidelines for skorch. (#1097)
+- Add an example of hyper-parameter optimization using [Optuna](https://optuna.org/) [here](https://github.com/skorch-dev/skorch/tree/master/examples/optuna) (#1098)
+- Add Example for Streaming Dataset(#1105)
+- Add pyproject.toml to Improve CI/CD and Tooling (#1108)
+
+### Changed
+
+- Loading of skorch nets using pickle: When unpickling a skorch net, you may come across a PyTorch warning that goes: "FutureWarning: You are using torch.load with weights_only=False [...]"; to avoid this warning, pickle the net again and use the new pickle file (#1092)
+
+### Fixed
+
+## [1.1.0]
+
+### Added
+
+- Added a [notebook](https://github.com/skorch-dev/skorch/blob/master/notebooks/Learning_Rate_Scheduler.ipynb) that shows how to use Learning Rate Scheduler in skorch.(#1074)
+
+### Changed
+
+- All neural net classes now inherit from sklearn's [`BaseEstimator`](https://scikit-learn.org/stable/modules/generated/sklearn.base.BaseEstimator.html). This is to support compatibility with sklearn 1.6.0 and above. Classification models additionally inherit from [`ClassifierMixin`](https://scikit-learn.org/stable/modules/generated/sklearn.base.ClassifierMixin.html) and regressors from [`RegressorMixin`](https://scikit-learn.org/stable/modules/generated/sklearn.base.RegressorMixin.html). (#1078)
+- When using the `ReduceLROnPlateau` learning rate scheduler, we now record the learning rate in the net history (`net.history[:, 'event_lr']` by default). It is now also possible to to step per batch, not only by epoch (#1075)
+- The learning rate scheduler `.simulate()` method now supports adding step args which is useful when simulation policies such as `ReduceLROnPlateau` which expect metrics to base their schedule on. (#1077)
+- Removed deprecated `skorch.callbacks.scoring.cache_net_infer` (#1088)
+
+### Fixed
+
+- Fix an issue with using `NeuralNetBinaryClassifier` with `torch.compile` (#1058)
+
+## [1.0.0] - 2024-05-27
+
+The 1.0.0 release of skorch is here. We think that skorch is at a very stable point, which is why a 1.0.0 release is appropriate. There are no plans to add any breaking changes or major revisions in the future. Instead, our focus now is to keep skorch up-to-date with the latest versions of PyTorch and scikit-learn, and to fix any bugs that may arise.
 
 ## [0.15.0] - 2023-09-04
 
@@ -344,3 +407,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.13.0]: https://github.com/skorch-dev/skorch/compare/v0.12.1...v0.13.0
 [0.14.0]: https://github.com/skorch-dev/skorch/compare/v0.13.0...v0.14.0
 [0.15.0]: https://github.com/skorch-dev/skorch/compare/v0.14.0...v0.15.0
+[1.0.0]: https://github.com/skorch-dev/skorch/compare/v0.15.0...v1.0.0
+[1.1.0]: https://github.com/skorch-dev/skorch/compare/v1.0.0...v1.1.0

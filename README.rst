@@ -9,25 +9,20 @@ A scikit-learn compatible neural network library that wraps PyTorch.
 
 .. |build| image:: https://github.com/skorch-dev/skorch/workflows/tests/badge.svg
     :alt: Test Status
-    :scale: 100%
 
 .. |coverage| image:: https://github.com/skorch-dev/skorch/blob/master/assets/coverage.svg
     :alt: Test Coverage
-    :scale: 100%
 
 .. |docs| image:: https://readthedocs.org/projects/skorch/badge/?version=latest
     :alt: Documentation Status
-    :scale: 100%
     :target: https://skorch.readthedocs.io/en/latest/?badge=latest
 
 .. |huggingface| image:: https://github.com/skorch-dev/skorch/actions/workflows/test-hf-integration.yml/badge.svg
     :alt: Hugging Face Integration
-    :scale: 100%
     :target: https://github.com/skorch-dev/skorch/actions/workflows/test-hf-integration.yml
 
 .. |powered| image:: https://github.com/skorch-dev/skorch/blob/master/assets/powered.svg
     :alt: Powered by
-    :scale: 100%
     :target: https://github.com/ottogroup/
 
 =========
@@ -135,7 +130,7 @@ skorch also provides many convenient features, among others:
 Installation
 ============
 
-skorch requires Python 3.8 or higher.
+skorch requires Python 3.9 or higher.
 
 conda installation
 ==================
@@ -182,10 +177,9 @@ To install skorch from source using conda, proceed as follows:
 
     git clone https://github.com/skorch-dev/skorch.git
     cd skorch
-    conda create -n skorch-env python=3.10
+    conda create -n skorch-env python=3.12
     conda activate skorch-env
-    conda install -c pytorch pytorch
-    python -m pip install -r requirements.txt
+    python -m pip install torch
     python -m pip install .
 
 If you want to help developing, run:
@@ -194,12 +188,10 @@ If you want to help developing, run:
 
     git clone https://github.com/skorch-dev/skorch.git
     cd skorch
-    conda create -n skorch-env python=3.10
+    conda create -n skorch-env python=3.12
     conda activate skorch-env
-    conda install -c pytorch pytorch
-    python -m pip install -r requirements.txt
-    python -m pip install -r requirements-dev.txt
-    python -m pip install -e .
+    python -m pip install torch
+    python -m pip install '.[test,docs,dev,extended]'
 
     py.test  # unit tests
     pylint skorch  # static code checks
@@ -216,7 +208,6 @@ For pip, follow these instructions instead:
     git clone https://github.com/skorch-dev/skorch.git
     cd skorch
     # create and activate a virtual environment
-    python -m pip install -r requirements.txt
     # install pytorch version for your system (see below)
     python -m pip install .
 
@@ -227,10 +218,8 @@ If you want to help developing, run:
     git clone https://github.com/skorch-dev/skorch.git
     cd skorch
     # create and activate a virtual environment
-    python -m pip install -r requirements.txt
     # install pytorch version for your system (see below)
-    python -m pip install -r requirements-dev.txt
-    python -m pip install -e .
+    python -m pip install -e '.[test,docs,dev,extended]'
 
     py.test  # unit tests
     pylint skorch  # static code checks
@@ -244,10 +233,10 @@ instructions for PyTorch, visit the `PyTorch website
 <http://pytorch.org/>`__. skorch officially supports the last four
 minor PyTorch versions, which currently are:
 
-- 2.0.1
-- 2.1.2
-- 2.2.2
-- 2.3.0
+- 2.10.0
+- 2.11.0
+- 2.12.1
+- 2.13.0
 
 However, that doesn't mean that older versions don't work, just that
 they aren't tested. Since skorch mostly relies on the stable part of
@@ -257,9 +246,6 @@ In general, running this to install PyTorch should work:
 
 .. code:: bash
 
-    # using conda:
-    conda install pytorch pytorch-cuda -c pytorch
-    # using pip
     python -m pip install torch
 
 ==================

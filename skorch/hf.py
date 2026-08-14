@@ -24,7 +24,7 @@ from skorch.dataset import unpack_data
 from skorch.utils import check_is_fitted, params_for
 
 
-class _HuggingfaceTokenizerBase(BaseEstimator, TransformerMixin):
+class _HuggingfaceTokenizerBase(TransformerMixin, BaseEstimator):
     """Base class for yet to train and pretrained tokenizers
 
     Implements the ``vocabulary_`` attribute and the methods
@@ -851,7 +851,7 @@ class AccelerateMixin:
 
     .. warning::
 
-        Since accelerate is still quite young and backwards compatiblity
+        Since accelerate is still quite young and backwards compatibility
         breaking features might be added, we treat its integration as an
         experimental feature. When accelerate's API stabilizes, we will consider
         adding it to skorch proper.
@@ -1021,7 +1021,7 @@ class AccelerateMixin:
 
     def _step_optimizer(self, step_fn):
         # We cannot step_fn as a 'closure' to .step because GradScaler doesn't
-        # suppor it:
+        # support it:
         # https://pytorch.org/docs/stable/amp.html#torch.cuda.amp.GradScaler.step
         # Therefore, we need to call step_fn explicitly and step without
         # argument.
@@ -1132,7 +1132,7 @@ class HfHubStorage:
 
     Note that writes to the Hub are synchronous. Therefore, if the time it takes
     to upload the data is long compared to training the model, there can be a
-    signficant slowdown. It is best to use this with
+    significant slowdown. It is best to use this with
     :class:`skorch.callbacks.training.TrainEndCheckpoint`, as that checkpoint
     only uploads the data once, at the end of training. Also, using this writer
     with :class:`skorch.callbacks.training.LoadInitState` is not supported for
@@ -1214,7 +1214,7 @@ class HfHubStorage:
     >>> # later...
     >>> import pickle
     >>> from huggingface_hub import hf_hub_download
-    >>> path = hf_hub_download(repo_name, model_name, use_auth_token=token)
+    >>> path = hf_hub_download(repo_name, model_name, token=token)
     >>> with open(path, 'rb') as f:
     >>>     net_loaded = pickle.load(f)
 

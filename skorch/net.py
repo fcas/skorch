@@ -1,7 +1,7 @@
 """Neural net base class
 
 This is the most flexible class, not making assumptions on the kind of
-task being peformed. Subclass this to create more specialized and
+task being performed. Subclass this to create more specialized and
 sklearn-conforming classes like NeuralNetClassifier.
 
 """
@@ -13,11 +13,19 @@ from itertools import chain
 from collections import OrderedDict
 from contextlib import contextmanager
 import os
+import pickle
 import tempfile
 import warnings
 
 import numpy as np
 from sklearn.base import BaseEstimator
+from sklearn.utils.metadata_routing import (
+    MetadataRouter,
+    MethodMapping,
+    UNUSED,
+    _routing_enabled,
+    process_routing,
+)
 import torch
 from torch.utils.data import DataLoader
 
@@ -29,15 +37,19 @@ from skorch.dataset import ValidSplit
 from skorch.dataset import get_len
 from skorch.dataset import unpack_data
 from skorch.exceptions import DeviceWarning
+from skorch.exceptions import NotInitializedError
 from skorch.exceptions import SkorchAttributeError
 from skorch.exceptions import SkorchTrainingImpossibleError
 from skorch.history import History
+from skorch.setter import format_param_group_msg
 from skorch.setter import optimizer_setter
+from skorch.utils import _TorchLoadUnpickler
 from skorch.utils import _identity
 from skorch.utils import _infer_predict_nonlinearity
 from skorch.utils import FirstStepAccumulator
 from skorch.utils import TeeGenerator
 from skorch.utils import _check_f_arguments
+from skorch.utils import _check_device
 from skorch.utils import check_is_fitted
 from skorch.utils import duplicate_items
 from skorch.utils import get_map_location
@@ -49,7 +61,7 @@ from skorch.utils import to_tensor
 
 
 # pylint: disable=too-many-instance-attributes
-class NeuralNet:
+class NeuralNet(BaseEstimator):
     # pylint: disable=anomalous-backslash-in-string
     """NeuralNet base class.
 
@@ -133,7 +145,7 @@ class NeuralNet:
       this if your data is not supported. You should generally pass the
       uninitialized ``Dataset`` class and define additional arguments to
       X and y by prefixing them with ``dataset__``. It is also possible
-      to pass an initialzed ``Dataset``, in which case no additional
+      to pass an initialized ``Dataset``, in which case no additional
       arguments may be passed.
 
     train_split : None or callable (default=skorch.dataset.ValidSplit(5))
@@ -208,8 +220,10 @@ class NeuralNet:
     device : str, torch.device, or None (default='cpu')
       The compute device to be used. If set to 'cuda' in order to use
       GPU acceleration, data in torch tensors will be pushed to cuda
-      tensors before being sent to the module. If set to None, then
-      all compute devices will be left unmodified.
+      tensors before being sent to the module. If set to 'auto',
+      hardware acceleration like CUDA is being used if available, and
+      CPU otherwise. If set to None, then all compute devices will be
+      left unmodified.
 
     compile : bool (default=False)
       If set to ``True``, compile all modules using ``torch.compile``. For this
@@ -234,6 +248,33 @@ class NeuralNet:
       all callbacks. If set to ``True``, caching will be enabled on all
       callbacks.
       Implementation note: It is the job of the callbacks to honor this setting.
+
+    torch_load_kwargs : dict or None (default=None)
+      Additional arguments that will be passed to torch.load when load pickled
+      parameters.
+
+      In particular, this is important to because PyTorch will switch (probably
+      in version 2.6.0) to only allow weights to be loaded for security reasons
+      (i.e weights_only switches from False to True). As a consequence, loading
+      pickled parameters may raise an error after upgrading torch because some
+      types are used that are considered insecure. In skorch, we will also make
+      that switch at the same time. To resolve the error, follow the
+      instructions in the torch error message to designate the offending types
+      as secure. Only do this if you trust the source of the file.
+
+      If you want to keep loading non-weight types the same way as before,
+      please pass:
+
+          torch_load_kwargs={'weights_only': False}
+
+      You should be aware that this is considered insecure and should only be
+      used if you trust the source of the file. However, this does not introduce
+      new insecurities, it rather corresponds to the status quo from before
+      torch made the switch.
+
+      Another way to avoid this issue is to pass use_safetensors=True when
+      calling save_params and load_params. This avoid using pickle in favor of
+      the safetensors format, which is secure by design.
 
     Attributes
     ----------
@@ -279,6 +320,13 @@ class NeuralNet:
       this list.
 
     """
+    # Suppress auto-generation of set_partial_fit_request that only
+    # allows 'classes'. We provide our own that accepts arbitrary
+    # metadata names, since partial_fit takes **fit_params.
+    # TODO: remove once scikit-learn/scikit-learn#32111 is merged and
+    # provides a public API for this.
+    __metadata_request__partial_fit = {"classes": UNUSED}
+
     prefixes_ = ['iterator_train', 'iterator_valid', 'callbacks', 'dataset', 'compile']
 
     cuda_dependent_attributes_ = []
@@ -311,6 +359,7 @@ class NeuralNet:
             device='cpu',
             compile=False,
             use_caching='auto',
+            torch_load_kwargs=None,
             **kwargs
     ):
         self.module = module
@@ -330,6 +379,7 @@ class NeuralNet:
         self.device = device
         self.compile = compile
         self.use_caching = use_caching
+        self.torch_load_kwargs = torch_load_kwargs
 
         self._check_deprecated_params(**kwargs)
         history = kwargs.pop('history', None)
@@ -628,7 +678,7 @@ class NeuralNet:
           Deprecated, don't use it anymore.
 
         """
-        # handle deprecated paramter
+        # handle deprecated parameter
         if triggered_directly is not None:
             warnings.warn(
                 "The 'triggered_directly' argument to 'initialize_optimizer' is "
@@ -651,7 +701,7 @@ class NeuralNet:
         return self
 
     def _format_reinit_msg(self, name, kwargs=None, triggered_directly=True):
-        """Returns a message that informs about re-initializing a compoment.
+        """Returns a message that informs about re-initializing a component.
 
         Sometimes, the module or optimizer need to be
         re-initialized. Not only should the user receive a message
@@ -784,24 +834,9 @@ class NeuralNet:
         module : torch.nn.Module or torch._dynamo.OptimizedModule
           The compiled module if ``compile=True``, otherwise the uncompiled module.
 
-        Raises
-        ------
-        ValueError
-          If ``compile=True`` but ``torch.compile`` is not available, raise an
-          error.
-
         """
-        # TODO: adjust docstring once we no longer support PyTorch versions without compile
         if not self.compile:
             return module
-
-        # Whether torch.compile is available (PyTorch 2.0 and up)
-        torch_compile_available = hasattr(torch, 'compile')
-        if not torch_compile_available:
-            raise ValueError(
-                "Setting compile=True but torch.compile is not available. Please "
-                f"check that your installed PyTorch version ({torch.__version__}) "
-                "supports torch.compile (requires v1.14, v2.0 or higher)")
 
         params = self.get_params_for('compile')
         module_compiled = torch.compile(module, **params)
@@ -1133,7 +1168,8 @@ class NeuralNet:
             self._set_training(training)
             return self.infer(Xi)
 
-    def fit_loop(self, X, y=None, epochs=None, **fit_params):
+    def fit_loop(self, X, y=None, epochs=None, *, _routing_method="fit",
+                 **fit_params):
         """The proper fit loop.
 
         Contains the logic of what actually happens during the fit
@@ -1173,8 +1209,26 @@ class NeuralNet:
         self.check_training_readiness()
         epochs = epochs if epochs is not None else self.max_epochs
 
+        if _routing_enabled():
+            # _routing_method matches the public entry point so the
+            # right self-request (fit vs partial_fit) is resolved.
+            routed_params = process_routing(
+                self, _routing_method, **fit_params)
+            split_params = routed_params.get(
+                "splitter", {"split": {}}
+            )["split"]
+            # Following sklearn's router+consumer pattern: the router
+            # uses its own params directly (they're already in
+            # fit_params), while children get theirs from
+            # routed_params. The module's forward method should accept
+            # **kwargs to handle any extra params.
+            forward_params = fit_params
+        else:
+            split_params = fit_params
+            forward_params = fit_params
+
         dataset_train, dataset_valid = self.get_split_datasets(
-            X, y, **fit_params)
+            X, y, **split_params)
         on_epoch_kwargs = {
             'dataset_train': dataset_train,
             'dataset_valid': dataset_valid,
@@ -1188,10 +1242,10 @@ class NeuralNet:
             self.notify('on_epoch_begin', **on_epoch_kwargs)
 
             self.run_single_epoch(iterator_train, training=True, prefix="train",
-                                  step_fn=self.train_step, **fit_params)
+                                  step_fn=self.train_step, **forward_params)
 
             self.run_single_epoch(iterator_valid, training=False, prefix="valid",
-                                  step_fn=self.validation_step, **fit_params)
+                                  step_fn=self.validation_step, **forward_params)
 
             self.notify("on_epoch_end", **on_epoch_kwargs)
         return self
@@ -1273,9 +1327,15 @@ class NeuralNet:
         if not self.initialized_:
             self.initialize()
 
+        # When called from fit(), _routing_method is threaded in via
+        # fit_params so partial_fit's public signature stays clean
+        # (sklearn introspects it to auto-generate routing machinery).
+        routing_method = fit_params.pop("_routing_method", "partial_fit")
+
         self.notify('on_train_begin', X=X, y=y)
         try:
-            self.fit_loop(X, y, **fit_params)
+            self.fit_loop(
+                X, y, _routing_method=routing_method, **fit_params)
         except KeyboardInterrupt:
             pass
         self.notify('on_train_end', X=X, y=y)
@@ -1316,8 +1376,104 @@ class NeuralNet:
         if not self.warm_start or not self.initialized_:
             self.initialize()
 
-        self.partial_fit(X, y, **fit_params)
+        self.partial_fit(X, y, _routing_method="fit", **fit_params)
         return self
+
+    def set_fit_request(self, **kwargs):
+        """Set requested parameters by the ``fit`` method.
+
+        Please see :ref:`sklearn:metadata_routing` for more details.
+
+        Since ``NeuralNet.fit`` accepts arbitrary ``**fit_params`` that
+        are passed to the module's forward method, metadata names cannot
+        be inferred from the signature and must be declared explicitly
+        using this method.
+
+        Parameters
+        ----------
+        **kwargs : dict
+            Arguments should be of the form ``param_name=alias``, where
+            ``alias`` can be one of ``{True, False, None, str}``.
+
+        Returns
+        -------
+        self : object
+            The updated object.
+        """
+        if not _routing_enabled():
+            raise RuntimeError(
+                "This method is only available when metadata routing is"
+                " enabled. You can enable it using"
+                " sklearn.set_config(enable_metadata_routing=True)."
+            )
+
+        requests = self._get_metadata_request()
+        for param, alias in kwargs.items():
+            requests.fit.add_request(param=param, alias=alias)
+        self._metadata_request = requests
+        return self
+
+    def set_partial_fit_request(self, **kwargs):
+        """Set requested parameters by the ``partial_fit`` method.
+
+        Please see :ref:`sklearn:metadata_routing` for more details.
+
+        Since ``NeuralNet.partial_fit`` accepts arbitrary ``**fit_params``
+        that are passed to the module's forward method, metadata names
+        cannot be inferred from the signature and must be declared
+        explicitly using this method.
+
+        Parameters
+        ----------
+        **kwargs : dict
+            Arguments should be of the form ``param_name=alias``, where
+            ``alias`` can be one of ``{True, False, None, str}``.
+
+        Returns
+        -------
+        self : object
+            The updated object.
+        """
+        if not _routing_enabled():
+            raise RuntimeError(
+                "This method is only available when metadata routing is"
+                " enabled. You can enable it using"
+                " sklearn.set_config(enable_metadata_routing=True)."
+            )
+
+        requests = self._get_metadata_request()
+        for param, alias in kwargs.items():
+            requests.partial_fit.add_request(param=param, alias=alias)
+        self._metadata_request = requests
+        return self
+
+    def get_metadata_routing(self):
+        """Get metadata routing of this object.
+
+        NeuralNet is both a consumer (its module's forward method
+        accepts arbitrary metadata) and a router (it routes metadata
+        like ``groups`` to its internal CV splitter).
+
+        Returns
+        -------
+        routing : MetadataRouter
+            A :class:`~sklearn.utils.metadata_routing.MetadataRouter`
+            encapsulating routing information.
+        """
+        router = MetadataRouter(owner=self.__class__.__name__)
+        router.add_self_request(self)
+
+        ts = self.train_split
+        if ts is not None and hasattr(ts, 'cv'):
+            router.add(
+                splitter=ts.cv,
+                method_mapping=(
+                    MethodMapping()
+                    .add(caller="fit", callee="split")
+                    .add(caller="partial_fit", callee="split")
+                ),
+            )
+        return router
 
     def check_is_fitted(self, attributes=None, *args, **kwargs):
         """Checks whether the net is initialized
@@ -1344,6 +1500,20 @@ class NeuralNet:
             attributes or [module + '_' for module in self._modules] or ['module_']
         )
         check_is_fitted(self, attributes, *args, **kwargs)
+
+    def __sklearn_is_fitted__(self):
+        """This method is called when sklearn's ``check_is_fitted`` is used.
+
+        Explained here:
+        https://scikit-learn.org/stable/auto_examples/developing_estimators/sklearn_is_fitted.html
+        """
+        is_fitted = False
+        try:
+            self.check_is_fitted()
+            is_fitted = True
+        except NotInitializedError:
+            pass
+        return is_fitted
 
     def trim_for_prediction(self):
         """Remove all attributes not required for prediction.
@@ -1424,7 +1594,7 @@ class NeuralNet:
 
         device : string (default='cpu')
           The device to store each inference result on.
-          This defaults to CPU memory since there is genereally
+          This defaults to CPU memory since there is generally
           more memory available there. For performance reasons
           this might be changed to a specific CUDA device,
           e.g. 'cuda:0'.
@@ -1472,7 +1642,7 @@ class NeuralNet:
 
         device : string (default='cpu')
           The device to store each inference result on.
-          This defaults to CPU memory since there is genereally
+          This defaults to CPU memory since there is generally
           more memory available there. For performance reasons
           this might be changed to a specific CUDA device,
           e.g. 'cuda:0'.
@@ -1861,7 +2031,13 @@ class NeuralNet:
             matches = [i for i, (name, _) in enumerate(params) if
                        fnmatch.fnmatch(name, pattern)]
             if matches:
-                p = [params.pop(i)[1] for i in reversed(matches)]
+                # pop high indices first so earlier indices stay valid
+                matched = [params.pop(i) for i in reversed(matches)]
+                p = [param for _, param in matched]
+                if self.verbose:
+                    # show names in the order they were matched
+                    matched_names = [name for name, _ in reversed(matched)]
+                    print(format_param_group_msg(group, matched_names))
                 pgroups.append({'params': p, **group})
 
         if params:
@@ -1938,7 +2114,12 @@ class NeuralNet:
         return args, kwargs
 
     def _get_param_names(self):
-        return [k for k in self.__dict__ if not k.endswith('_')]
+        # Exclude _metadata_request: it is set by set_fit_request()
+        # (not __init__), and sklearn's clone() handles it separately
+        # via deepcopy. Including it here would cause clone() to pass
+        # it to the constructor, which doesn't expect it.
+        return [k for k in self.__dict__
+                if not k.endswith('_') and k != '_metadata_request']
 
     def _get_params_callbacks(self, deep=True):
         """sklearn's .get_params checks for `hasattr(value,
@@ -1962,7 +2143,7 @@ class NeuralNet:
         return params
 
     def get_params(self, deep=True, **kwargs):
-        params = BaseEstimator.get_params(self, deep=deep, **kwargs)
+        params = super().get_params(deep=deep, **kwargs)
         # Callback parameters are not returned by .get_params, needs
         # special treatment.
         params_cb = self._get_params_callbacks(deep=deep)
@@ -2081,7 +2262,7 @@ class NeuralNet:
                 normal_params[key] = val
 
         self._apply_virtual_params(virtual_params)
-        BaseEstimator.set_params(self, **normal_params)
+        super().set_params(**normal_params)
 
         for key, val in special_params.items():
             if key.endswith('_'):
@@ -2176,7 +2357,7 @@ class NeuralNet:
             if '__' not in name and name in names:
                 self._replace_callback(name, params.pop(key))
 
-        # 3. Step parameters and other initilisation arguments
+        # 3. Step parameters and other initialisation arguments
         for key in params.copy():
             name = key[11:]
             part0, part1 = name.split('__')
@@ -2212,7 +2393,7 @@ class NeuralNet:
             state.pop(k)
 
         with tempfile.SpooledTemporaryFile() as f:
-            torch.save(cuda_attrs, f)
+            pickle.dump(cuda_attrs, f)
             f.seek(0)
             state['__cuda_dependent_attributes__'] = f.read()
 
@@ -2224,11 +2405,26 @@ class NeuralNet:
         map_location = get_map_location(state['device'])
         load_kwargs = {'map_location': map_location}
         state['device'] = self._check_device(state['device'], map_location)
+        torch_load_kwargs = state.get('torch_load_kwargs') or {"weights_only": True}
 
         with tempfile.SpooledTemporaryFile() as f:
+            unpickler = _TorchLoadUnpickler(
+                f,
+                map_location=map_location,
+                torch_load_kwargs=torch_load_kwargs,
+            )
             f.write(state['__cuda_dependent_attributes__'])
             f.seek(0)
-            cuda_attrs = torch.load(f, **load_kwargs)
+            try:
+                cuda_attrs = unpickler.load()
+            except pickle.UnpicklingError:
+                # This object was saved using skorch from before switching to the
+                # custom unpickler, i.e. with torch.save. Fall back to the old loading
+                # code using torch.load. Unfortunately, this means that the user may
+                # get the FutureWarning about weights_only=False. They need to re-save
+                # the net to get rid of the warning
+                f.seek(0)
+                cuda_attrs = torch.load(f, **load_kwargs)
 
         state.update(cuda_attrs)
         state.pop('__cuda_dependent_attributes__')
@@ -2338,12 +2534,12 @@ class NeuralNet:
 
         """
         if (self.init_context_ is None) and isinstance(attr, torch.nn.Module):
-            msg = ("Trying to set torch compoment '{}' outside of an initialize method."
+            msg = ("Trying to set torch component '{}' outside of an initialize method."
                    " Consider defining it inside 'initialize_module'".format(name))
             raise SkorchAttributeError(msg)
 
         if (self.init_context_ is None) and isinstance(attr, torch.optim.Optimizer):
-            msg = ("Trying to set torch compoment '{}' outside of an initialize method."
+            msg = ("Trying to set torch component '{}' outside of an initialize method."
                    " Consider defining it inside 'initialize_optimizer'".format(name))
             raise SkorchAttributeError(msg)
 
@@ -2533,6 +2729,9 @@ class NeuralNet:
             warnings.warn(msg, DeviceWarning)
             return map_device
 
+        if requested_device == 'auto':
+            return map_device
+
         type_1 = torch.device(requested_device)
         type_2 = torch.device(map_device)
         if type_1 != type_2:
@@ -2610,7 +2809,10 @@ class NeuralNet:
 
                 if isinstance(f_name, (str, os.PathLike)):
                     state_dict = {}
-                    with safe_open(f_name, framework='pt', device=self.device) as f:
+                    with safe_open(
+                            f_name,
+                            framework='pt',
+                            device=_check_device(self.device)) as f:
                         for key in f.keys():
                             state_dict[key] = f.get_tensor(key)
                 else:
@@ -2620,10 +2822,14 @@ class NeuralNet:
 
                 return state_dict
         else:
+            torch_load_kwargs = self.torch_load_kwargs
+            if torch_load_kwargs is None:
+                torch_load_kwargs = {"weights_only": True}
+
             def _get_state_dict(f_name):
                 map_location = get_map_location(self.device)
                 self.device = self._check_device(self.device, map_location)
-                return torch.load(f_name, map_location=map_location)
+                return torch.load(f_name, map_location=map_location, **torch_load_kwargs)
 
         kwargs_full = {}
         if checkpoint is not None:
